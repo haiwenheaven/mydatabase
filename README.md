@@ -1,0 +1,2 @@
+# mydatabase
+imitation of sqlite
