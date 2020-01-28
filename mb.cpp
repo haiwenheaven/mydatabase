@@ -3,7 +3,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h> 
+#include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h> 
 
 //输入缓存
 #define max_buffer_length 100 
@@ -62,7 +65,7 @@ const unsigned int row_size=id_size+username_size+email_size;
 //pager相关，pager是table的缓存 
 #define table_max_pages 100//一张表最多的页数 
 typedef struct{
-	int file_descriptior;//文件的标识符 
+	int file_descriptor;//文件的标识符 
 	unsigned int file_length;//文件的长度 
 	void* pages[table_max_pages];//一页的起始地址
 }pager;
@@ -73,23 +76,138 @@ const unsigned int rows_per_page=page_size/row_size;//每一页的行数
 const unsigned int table_max_rows=rows_per_page*table_max_pages;//每张表的行数 
 typedef struct{
 	unsigned int num_rows;//记录目前这张表的行数
-	pager* p;
+	pager* p;//这张表的缓冲区 
 }table;
-table* new_table()
+
+//打开这张表对应的文件并建立一个缓冲区，返回这个缓冲区
+pager* pager_open(const char* filename)
 {
+	/*
+	int open(const char* pathname,int flags,mode_t mode)
+	pathname:指向欲打开文件路径字符串
+	flags:旗标，表明打开文件的方式
+	mode:只有在新建文件时才会生效，与文件权限有关
+	返回值:若所有欲核查的权限都通过了检查则返回该文件的文件描述符，表示成功，只要有一个权限被禁止则返回-1。
+	*/
+	int fd=open(filename,O_RDWR | O_CREAT);
+	if(fd==-1)
+	{
+		printf("unable to open file.\n");
+		exit(EXIT_FAILURE);
+	}
+	/*
+	off_t:用来指示文件的偏移量 
+	*/
+	/*
+	off_t lseek(int filedes,off_t offset,int whence)
+	功能:lseek()便是用来控制该文件的读写位置.
+		 每一个打开的文件都有一个读写位置，当打开文件时通常其读写位置是指向文件开头
+	 	 若是若是以附加的方式打开文件(如O_APPEND), 则读写位置会指向文件尾. 
+	     当read()或write()时, 读写位置会随之增加。
+	fileds:打开文件的描述符 
+	offset:根据参数whence来移动读写位置的位移数 
+	whence:
+		SEEK_SET 参数offset 即为新的读写位置.
+    	SEEK_CUR 以目前的读写位置往后增加offset 个位移量.
+    	SEEK_END 将读写位置指向文件尾后再增加offset 个位移量. 当whence 值为SEEK_CUR 或
+    	SEEK_END 时, 参数offet 允许负值的出现.
+    另:fseek()用来移动文件流的读写位置 
+	*/ 
+	off_t file_length=lseek(fd,0,SEEK_END);
+	pager* p=(pager*)malloc(sizeof(pager));
+	p->file_descriptor=fd;
+	p->file_length=file_length; 
+	//开始时缓冲区为空 
+	for (uint32_t i = 0; i < table_max_pages; i++) 
+	{
+   		p->pages[i] = NULL;
+ 	}
+	 return p; 
+}
+//打开一个文件并为其建立一个缓冲区，缓冲区初始为空 
+table* db_open(const char* filename)
+{
+	pager* p=pager_open(filename);//打开文件 
+	unsigned int num_rows=p->file_length/row_size;//文件中的行数	
 	table* t=(table*)malloc(sizeof(table));
-	t->num_rows=0;
+	t->p=p;
+	t->num_rows=num_rows;
+	return t;
+}
+
+//把pager中第page_num页共size个字节复制到硬盘 
+void pager_flush(pager *p,unsigned int page_num,unsigned int size)
+{
+	if(p->pages[page_num]==NULL)
+	{
+		printf("tried to flush null page.\n");
+		exit(EXIT_FAILURE);	
+	}
+	off_t offset=lseek(p->file_descriptor,page_num*page_size,SEEK_SET);
+	if(offset==-1)
+	{
+		printf("error seeking.\n");
+		exit(EXIT_FAILURE);
+	}
+	/*
+	ssize_t write(int fd,char* buffer,int size)
+	功能:从buffer中写size大小的字节到文件fd中 
+	*/
+	ssize_t bytes_written=write(p->file_descriptor,p->pages[page_num],size);
+	if(bytes_written==-1)
+	{
+		printf("error writing.\n");
+		exit(EXIT_FAILURE);
+	 } 
+}
+
+//关闭文件并把缓存中的数据复制到硬盘 
+void db_close(table* t)
+{
+	//先把这些满页复制到硬盘并释放内存 
+	unsigned int pages_full_num=t->num_rows/rows_per_page;
+	for(unsigned int i=0;i<pages_full_num;i++)
+	{
+		if(t->p->pages[i]==NULL)//说明这一页还没有加载到内存，不用复制到硬盘 
+		{
+			continue;	
+		}
+		pager_flush(t->p,i,page_size);
+		//free(t->p->pages[i]);
+		//t->p->pages[i]=NULL;重复操作？ 
+	}
+	//最后一页可能没有满 
+	if(t->num_rows%rows_per_page)
+	{
+		if(t->p->pages[pages_full_num]!=NULL)
+		{
+			pager_flush(t->p,pages_full_num,(t->num_rows%rows_per_page)*row_size);
+			free(t->p->pages[pages_full_num]);
+			t->p->pages[pages_full_num]=NULL;
+		}
+	}
+	//关闭文件
+	/*
+	int close(int fd)
+	功能:关闭一个已经打开的文件
+	fd:文件描述符
+	返回值:成功返回0，失败返回-1 
+	*/
+	int result=close(t->p->file_descriptor);
+	if(result==-1)
+	{
+		printf("error closing db file.\n");
+		exit(EXIT_FAILURE);
+	}
 	for(int i=0;i<table_max_pages;i++)
 	{
-		t->pages[i]=NULL;	
-	}	
-}
-void free_table(table* t)
-{
-	for(int i=0;t->pages[i];i++)
-	{
-		free(t->pages[i]);
+		if(t->p->pages[i])
+		{
+			free(t->p->pages[i]);
+			t->p->pages[i]=NULL;
+		}
 	}
+	free(t->p);
 	free(t);
 }
 
@@ -105,7 +223,7 @@ MetaCommandResult do_meta_command(table* t)
 {
 	if (strcmp(buffer, ".exit") == 0)
 	{
-		free_table(t);
+		db_close(t); 
     	exit(EXIT_SUCCESS);
   	}
 	else
@@ -231,19 +349,53 @@ void deserialize(void* source,row* destination)
 	memcpy(&(destination->email),source+email_offset,email_size);
 }
 
-//通过行数找到内存中的第n+1行的起始位置,返回地址 
-void* row_slot(int n,table* t)
+void* get_page(pager* p,unsigned int page_num)
 {
-	//计算这一行在哪一页，如果这一页为空，则分配内存 
-	unsigned int pagenum=n/rows_per_page;
-	if(t->pages[pagenum]==NULL)
+	if(page_num>table_max_pages)//表满了 
 	{
-		t->pages[pagenum]=malloc(page_size);
+		printf("tried to fetch page number out of bounds.\n");
+		exit(EXIT_FAILURE);
 	}
+	
+	if(p->pages[page_num]==NULL)//缓存miss，从硬盘复制到内存 
+	{
+		p->pages[page_num]=(void*)malloc(page_size);
+		unsigned int num_pages_now=p->file_length/page_size;
+		if((p->file_length%page_size)>0)
+		{
+			num_pages_now++;
+		}
+		/*
+		ssize_t read(int fd,void* buf,size_t count)
+		fd:文件描述符 
+		buf:读出数据的缓冲区
+		count:读取的字节数
+		返回值:实际读到的字节数，当有错误时返回-1 
+		*/
+		if(page_num<=num_pages_now)//当page_num没有越界时，才把硬盘中的数据复制到内存，否则直接给p->pages[page_num]分配内存就可以返回了 
+		{
+			lseek(p->file_descriptor,page_num*page_size,SEEK_SET);//找到这个文件这一行的起始位置 ，把读写位置设置在这里 
+			ssize_t bytes_read=read(p->file_descriptor,p->pages[page_num],page_size);
+			if(bytes_read==-1)
+			{
+				printf("error reading file.\n");
+				exit(EXIT_FAILURE);
+			}
+		}
+	}
+	return p->pages[page_num];
+}
+//通过行数找到内存中的第n+1行的起始位置,如果miss了，则从硬盘中取，返回地址 
+void* row_slot(unsigned int n,table* t)
+{
+	//计算这一行在哪一页 
+	unsigned int page_num=n/rows_per_page;
+	//如果内存中没有这一页的缓存，则硬盘中读出这一页 
+	void* page=get_page(t->p,page_num);
 	//计算在这一页的哪一行，并计算这一行的起始地址 
 	unsigned int rownum_in_this_page=n%rows_per_page;
 	unsigned int byte=rownum_in_this_page*row_size;
-	return t->pages[pagenum]+byte;
+	return page+byte;
 }
 
 
@@ -294,7 +446,14 @@ ExecuteResult execute_statement(Statement* s,table* t)
 
 int main(int argc, char* argv[])
 {
-	table *t=new_table();	
+	if(argc<2)
+	{
+		printf("must supply a database filename.\n");
+		exit(EXIT_FAILURE);
+	}
+	
+	char* filename=argv[1];
+	table *t=db_open(filename);	
 	while (true) 
 	{ 
 		print_prompt();
